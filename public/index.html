@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>字幕时间轴修整器</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>字幕时间轴修整器</h1>
+    <div class="toolbar">
+      <button id="btn-import" class="primary">导入 SRT</button>
+      <input type="file" id="file-input" accept=".srt,.txt" hidden>
+      <button id="btn-demo">载入示例</button>
+      <button id="btn-undo" disabled>撤销</button>
+      <button id="btn-retime">区间变速</button>
+      <button id="btn-export" class="primary" disabled>导出 SRT</button>
+      <span class="sep"></span>
+      <button id="btn-zoom-out" title="缩小">−</button>
+      <input type="range" id="zoom-slider" min="0" max="100" value="47">
+      <button id="btn-zoom-in" title="放大">＋</button>
+      <button id="btn-zoom-fit">适应宽度</button>
+      <span id="zoom-label" class="mono"></span>
+    </div>
+  </header>
+
+  <section id="retime-panel" hidden>
+    <div class="retime-row">
+      <label>入点 <input id="retime-in" class="mono" type="text" placeholder="00:00:02,000"></label>
+      <label>出点 <input id="retime-out" class="mono" type="text" placeholder="00:00:06,000"></label>
+      <label>目标时长 <input id="retime-target" class="mono" type="text" placeholder="3.5 或 00:00:03,500"></label>
+      <button id="btn-retime-preview" class="primary">预览</button>
+      <button id="btn-retime-apply" disabled>应用变速</button>
+      <button id="btn-retime-cancel" disabled>取消预览</button>
+      <button id="btn-retime-close" title="收起面板">收起</button>
+    </div>
+    <div id="retime-info"></div>
+    <ul id="retime-conflicts"></ul>
+  </section>
+
+  <main>
+    <section id="timeline-scroll">
+      <div id="timeline-content">
+        <div id="ruler"></div>
+        <div id="track"></div>
+        <div id="range-overlay" hidden></div>
+      </div>
+      <div id="empty-hint">
+        将 .srt 文件拖入页面，或点击「导入 SRT」<br>
+        也可以先点击「载入示例」体验拖动修整
+      </div>
+    </section>
+
+    <section id="cue-list">
+      <table>
+        <thead>
+          <tr><th class="col-idx">#</th><th>开始</th><th>结束</th><th>时长</th><th>文本</th></tr>
+        </thead>
+        <tbody id="cue-list-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer id="status">就绪</footer>
+
+  <script src="engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "srt-timeline-trimmer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "本地运行的字幕时间轴修整 Web 应用（Node.js + Express + 原生前端）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
