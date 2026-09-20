@@ -322,3 +322,75 @@ tbody tr.selected { background: #2a2f45; }
 }
 
 tbody tr.retime-affected { background: rgba(63, 185, 80, 0.08); }
+
+/* ---------- 帧对齐 ---------- */
+
+#frame-panel {
+  flex: none;
+  max-height: 42%;
+  padding: 8px 16px;
+  background: #1a1c26;
+  border-bottom: 1px solid #2c2f3c;
+  overflow: auto;
+}
+
+#frame-panel:not([hidden]) { display: flex; flex-direction: column; }
+
+.retime-row select {
+  background: #14151b;
+  border: 1px solid #3a3e4f;
+  color: #e6e6eb;
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.retime-row select:focus { outline: none; border-color: #2f5fd0; }
+.retime-row select:disabled { opacity: 0.5; }
+
+#frame-tolerance { width: 64px; }
+
+#frame-info {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8fd18f;
+}
+
+#frame-info.warn { color: #f0b35e; }
+
+#frame-conflicts {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+#frame-conflicts li {
+  color: #f0b35e;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+#frame-conflicts li:hover { text-decoration: underline; }
+
+#frame-preview {
+  margin-top: 8px;
+  overflow: auto;
+  border: 1px solid #2c2f3c;
+  border-radius: 6px;
+}
+
+#frame-preview table { font-size: 12px; }
+
+#frame-preview th, #frame-preview td { padding: 4px 8px; }
+
+td.delta-pos { color: #7fb0ff; }
+td.delta-neg { color: #f0b35e; }
+td.delta-zero { color: #6b7086; }
+
+.block.frame-affected {
+  border-color: #3fb950;
+  box-shadow: 0 0 0 1px #3fb950;
+}
+
+tbody tr.frame-affected { background: rgba(63, 185, 80, 0.08); }

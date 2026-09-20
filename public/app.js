@@ -5,7 +5,7 @@
   const {
     MIN_DURATION_MS, MIN_GAP_MS,
     msToTimecode, parseTimeInput, parseSrt, formatSrt, normalize,
-    applyDrag, applyMove, planRetime, applyPlan, validate,
+    applyDrag, applyMove, planRetime, applyPlan, planFrameAlign, validate,
   } = SubEngine;
 
   const MIN_PPS = 10;    // 像素/秒，缩放范围
@@ -19,6 +19,7 @@
     selected: -1,
     drag: null,        // {index, edge: 'start'|'end'|'move', moved, grabOffset, el, snapshot}
     retime: null,      // 变速预览中 {plan, backup, affectedSet}
+    frameAlign: null,  // 帧对齐预览中 {plan, backup, affectedSet}
     rangeOverlay: null,// 时间轴区间覆盖层 {fromMs, toMs, preview}
     fileName: 'edited.srt',
   };
@@ -82,13 +83,16 @@
 
   function updateBlocks(from) {
     const pps = state.pxPerSec;
-    const affected = state.retime ? state.retime.affectedSet : null;
+    const affected = state.retime
+      ? state.retime.affectedSet
+      : (state.frameAlign ? state.frameAlign.affectedSet : null);
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const el = blockEls[i];
       el.style.left = (c.start / 1000 * pps) + 'px';
       el.style.width = ((c.end - c.start) / 1000 * pps) + 'px';
-      el.classList.toggle('retime-affected', !!(affected && affected.has(i)));
+      el.classList.toggle('retime-affected', !!state.retime && affected.has(i));
+      el.classList.toggle('frame-affected', !!state.frameAlign && affected.has(i));
       el.querySelector('.block-time').textContent =
         msToTimecode(c.start) + ' → ' + msToTimecode(c.end);
       const textEl = el.querySelector('.block-text');
@@ -97,7 +101,9 @@
   }
 
   function updateRows(from) {
-    const affected = state.retime ? state.retime.affectedSet : null;
+    const affected = state.retime
+      ? state.retime.affectedSet
+      : (state.frameAlign ? state.frameAlign.affectedSet : null);
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const td = rowEls[i].children;
@@ -106,7 +112,8 @@
       td[2].textContent = msToTimecode(c.end);
       td[3].textContent = ((c.end - c.start) / 1000).toFixed(3) + 's';
       if (td[4].textContent !== c.text) td[4].textContent = c.text;
-      rowEls[i].classList.toggle('retime-affected', !!(affected && affected.has(i)));
+      rowEls[i].classList.toggle('retime-affected', !!state.retime && affected.has(i));
+      rowEls[i].classList.toggle('frame-affected', !!state.frameAlign && affected.has(i));
     }
   }
 
@@ -149,7 +156,8 @@
 
   function updateUndoButton() {
     const btn = $('#btn-undo');
-    btn.disabled = state.undoStack.length === 0 || !!state.retime; // 预览期间禁止撤销
+    const previewing = !!state.retime || !!state.frameAlign;
+    btn.disabled = state.undoStack.length === 0 || previewing; // 预览期间禁止撤销
     btn.textContent = state.undoStack.length ? '撤销 (' + state.undoStack.length + ')' : '撤销';
   }
 
@@ -213,7 +221,7 @@
   /* ---------------- 拖动 ---------------- */
 
   trackEl.addEventListener('pointerdown', (e) => {
-    if (state.retime) return; // 变速预览期间禁止拖动
+    if (state.retime || state.frameAlign) return; // 预览期间禁止拖动
     const blockEl = e.target.closest('.block');
     if (!blockEl) return;
     const index = Number(blockEl.dataset.i);
@@ -271,7 +279,7 @@
   /* ---------------- 撤销 ---------------- */
 
   function undo() {
-    if (state.retime) return; // 变速预览期间禁止撤销
+    if (state.retime || state.frameAlign) return; // 预览期间禁止撤销
     const snap = state.undoStack.pop();
     if (!snap) return;
     state.cues.forEach((c, i) => { c.start = snap[i].start; c.end = snap[i].end; });
@@ -286,6 +294,8 @@
       undo();
     } else if (e.key === 'Escape' && state.retime) {
       cancelRetime(); // Esc 取消变速预览
+    } else if (e.key === 'Escape' && state.frameAlign) {
+      cancelFrameAlign(); // Esc 取消帧对齐预览
     }
   });
 
@@ -354,13 +364,8 @@
     positionRangeOverlay();
   }
 
-  function setPreviewUi(previewing) {
-    btnRetimePreview.disabled = previewing;
-    btnRetimeApply.disabled = !previewing;
-    btnRetimeCancel.disabled = !previewing;
-    retimeIn.disabled = retimeOut.disabled = retimeTarget.disabled = previewing;
-    $('#btn-export').disabled = previewing || !state.cues.length;
-    updateUndoButton();
+  function setPreviewUi() {
+    syncFrameControls(); // 两个面板互斥，控件状态统一由 syncFrameControls 同步
   }
 
   function openRetimePanel() {
@@ -402,7 +407,7 @@
   }
 
   function previewRetime() {
-    if (state.retime || !state.cues.length) return;
+    if (state.retime || state.frameAlign || !state.cues.length) return;
     clearConflicts();
     const { inMs, outMs, targetMs } = readRetimeParams();
     if (inMs == null || outMs == null || targetMs == null) {
@@ -472,6 +477,216 @@
     if (e.key === 'Enter') previewRetime();
   }));
 
+  /* ---------------- 帧对齐 ---------------- */
+
+  const framePanel = $('#frame-panel');
+  const frameFps = $('#frame-fps');
+  const frameTolerance = $('#frame-tolerance');
+  const frameInfo = $('#frame-info');
+  const frameConflictsEl = $('#frame-conflicts');
+  const framePreviewWrap = $('#frame-preview');
+  const framePreviewBody = $('#frame-preview-body');
+  const btnFrame = $('#btn-frame');
+  const btnFramePreview = $('#btn-frame-preview');
+  const btnFrameApply = $('#btn-frame-apply');
+  const btnFrameCancel = $('#btn-frame-cancel');
+  const btnFrameClose = $('#btn-frame-close');
+
+  function setFrameInfo(msg, warn) {
+    frameInfo.textContent = msg;
+    frameInfo.classList.toggle('warn', !!warn);
+  }
+
+  function clearFrameConflicts() {
+    frameConflictsEl.textContent = '';
+  }
+
+  function showFrameConflicts(conflicts) {
+    clearFrameConflicts();
+    for (const c of conflicts) {
+      const li = document.createElement('li');
+      li.textContent = '⚠ ' + c.message + '（点击定位）';
+      li.addEventListener('click', () => {
+        selectCue(c.index);
+        scrollBlockIntoView(c.index);
+      });
+      frameConflictsEl.appendChild(li);
+    }
+  }
+
+  function readFrameParams() {
+    const raw = String(frameTolerance.value).trim();
+    const toleranceMs = /^\d+$/.test(raw) ? parseInt(raw, 10) : null;
+    return { fpsLabel: frameFps.value, toleranceMs };
+  }
+
+  // 两个面板互斥：任一方预览中时锁定另一方的全部入口；同时锁定拖动、撤销与导出
+  function syncFrameControls() {
+    const framePreviewing = !!state.frameAlign;
+    const retimePreviewing = !!state.retime;
+    btnFramePreview.disabled = framePreviewing || retimePreviewing || !state.cues.length;
+    btnFrameApply.disabled = !framePreviewing;
+    btnFrameCancel.disabled = !framePreviewing;
+    frameFps.disabled = frameTolerance.disabled = framePreviewing;
+    btnRetimePreview.disabled = retimePreviewing || framePreviewing || !state.cues.length;
+    btnRetimeApply.disabled = !retimePreviewing;
+    btnRetimeCancel.disabled = !retimePreviewing;
+    retimeIn.disabled = retimeOut.disabled = retimeTarget.disabled = retimePreviewing;
+    $('#btn-retime').disabled = framePreviewing;
+    btnFrame.disabled = retimePreviewing;
+    $('#btn-export').disabled = framePreviewing || retimePreviewing || !state.cues.length;
+    updateUndoButton();
+  }
+
+  function openFramePanel() {
+    if (!state.cues.length) {
+      statusEl.textContent = '⚠ 请先导入字幕，再使用帧对齐';
+      statusEl.classList.add('warn');
+      return;
+    }
+    if (state.retime) return; // 变速预览中不允许打开（入口按钮已禁用）
+    framePanel.hidden = false;
+    clearFrameConflicts();
+    framePreviewWrap.hidden = true;
+    syncFrameControls();
+    setFrameInfo('选择帧率并设置单点最大允许偏移（ms），点击「预览」查看全局最优帧对齐方案', false);
+  }
+
+  function closeFramePanel() {
+    if (state.frameAlign) cancelFrameAlign(); // 收起面板视同取消预览
+    framePanel.hidden = true;
+    clearFrameConflicts();
+    framePreviewWrap.hidden = true;
+  }
+
+  // 导入新文件时调用：丢弃预览状态（字幕已被整体替换，无需恢复备份）
+  function resetFrameAlign() {
+    state.frameAlign = null;
+    framePanel.hidden = true;
+    clearFrameConflicts();
+    framePreviewWrap.hidden = true;
+    framePreviewBody.textContent = '';
+    syncFrameControls();
+  }
+
+  function deltaText(d) {
+    if (d > 0) return '+' + d;
+    if (d < 0) return String(d);
+    return '0';
+  }
+
+  function fillDeltaCell(td, d) {
+    td.textContent = deltaText(d);
+    td.className = d > 0 ? 'delta-pos' : d < 0 ? 'delta-neg' : 'delta-zero';
+  }
+
+  // 预览逐条显示对齐前后时间码与偏移，点击行可定位
+  function renderFramePreviewTable(plan) {
+    framePreviewBody.textContent = '';
+    const frag = document.createDocumentFragment();
+    plan.changes.forEach(ch => {
+      const before = state.frameAlign.backup[ch.index];
+      const tr = document.createElement('tr');
+      const tdIdx = document.createElement('td');
+      const tdBefore = document.createElement('td');
+      const tdAfter = document.createElement('td');
+      const tdDStart = document.createElement('td');
+      const tdDEnd = document.createElement('td');
+      const tdText = document.createElement('td');
+      tdIdx.textContent = ch.index + 1;
+      tdBefore.textContent = msToTimecode(before.start) + ' → ' + msToTimecode(before.end);
+      tdAfter.textContent = msToTimecode(ch.start) + ' → ' + msToTimecode(ch.end);
+      fillDeltaCell(tdDStart, ch.startDelta);
+      fillDeltaCell(tdDEnd, ch.endDelta);
+      tdText.textContent = state.cues[ch.index].text;
+      tr.append(tdIdx, tdBefore, tdAfter, tdDStart, tdDEnd, tdText);
+      tr.addEventListener('click', () => {
+        selectCue(ch.index);
+        scrollBlockIntoView(ch.index);
+      });
+      frag.appendChild(tr);
+    });
+    framePreviewBody.appendChild(frag);
+    framePreviewWrap.hidden = false;
+  }
+
+  function previewFrameAlign() {
+    if (state.frameAlign || state.retime || !state.cues.length) return;
+    clearFrameConflicts();
+    const { fpsLabel, toleranceMs } = readFrameParams();
+    if (toleranceMs == null) {
+      framePreviewWrap.hidden = true;
+      setFrameInfo('⚠ 单点最大允许偏移必须是不小于 0 的整数毫秒', true);
+      return;
+    }
+    const plan = planFrameAlign(state.cues, fpsLabel, toleranceMs);
+    if (!plan.ok) {
+      framePreviewWrap.hidden = true;
+      if (plan.conflicts) {
+        showFrameConflicts(plan.conflicts);
+        setFrameInfo('⚠ 存在 ' + plan.conflicts.length +
+          ' 处问题，未修改任何字幕；点击上方条目可定位问题字幕，调大容差或先手动修整后重新预览', true);
+      } else {
+        setFrameInfo('⚠ ' + plan.reason, true);
+      }
+      return;
+    }
+    // 进入预览：备份现状并应用方案，「取消预览」可原样恢复
+    state.frameAlign = {
+      plan,
+      backup: state.cues.map(c => ({ start: c.start, end: c.end })),
+      affectedSet: new Set(plan.changes.map(ch => ch.index)),
+    };
+    applyPlan(state.cues, plan);
+    renderFramePreviewTable(plan);
+    syncFrameControls();
+    const moved = plan.changes.filter(ch => ch.startDelta !== 0 || ch.endDelta !== 0).length;
+    setFrameInfo(
+      '预览中：' + fpsLabel + ' fps（帧周期 ' + plan.frameMs.toFixed(3) +
+      'ms）· 容差 ±' + toleranceMs + 'ms/点 · 共 ' + plan.changes.length + ' 条，' + moved +
+      ' 条发生移动 · 总绝对偏移 ' + plan.totalDeltaMs + 'ms · 单点最大偏移 ' + plan.maxDeltaMs +
+      'ms。确认后点击「确认对齐」（仅产生一条撤销记录），或「取消预览」(Esc) 恢复。', false);
+    renderAll();
+  }
+
+  function cancelFrameAlign() {
+    if (!state.frameAlign) return;
+    const backup = state.frameAlign.backup;
+    state.cues.forEach((c, i) => { c.start = backup[i].start; c.end = backup[i].end; });
+    state.frameAlign = null;
+    syncFrameControls();
+    framePreviewWrap.hidden = true;
+    framePreviewBody.textContent = '';
+    setFrameInfo('已取消预览，未修改任何字幕。', false);
+    renderAll();
+  }
+
+  function applyFrameAlign() {
+    if (!state.frameAlign) return;
+    state.undoStack.push(state.frameAlign.backup); // 一次对齐只产生一条撤销记录
+    if (state.undoStack.length > UNDO_LIMIT) state.undoStack.shift();
+    const plan = state.frameAlign.plan;
+    state.frameAlign = null;
+    syncFrameControls();
+    framePreviewWrap.hidden = true;
+    framePreviewBody.textContent = '';
+    updateUndoButton();
+    setFrameInfo('已按 ' + plan.fpsLabel + ' fps 完成帧对齐（总绝对偏移 ' + plan.totalDeltaMs +
+      'ms，单点最大偏移 ' + plan.maxDeltaMs + 'ms）。可用「撤销」或 Ctrl+Z 回退。', false);
+    renderAll();
+  }
+
+  btnFrame.addEventListener('click', () => {
+    if (framePanel.hidden) openFramePanel(); else closeFramePanel();
+  });
+  btnFrameClose.addEventListener('click', closeFramePanel);
+  btnFramePreview.addEventListener('click', previewFrameAlign);
+  btnFrameApply.addEventListener('click', applyFrameAlign);
+  btnFrameCancel.addEventListener('click', cancelFrameAlign);
+  frameTolerance.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') previewFrameAlign();
+  });
+
   /* ---------------- 缩放 ---------------- */
 
   const sliderToPps = (v) => Math.round(MIN_PPS * Math.pow(MAX_PPS / MIN_PPS, v / 100));
@@ -515,6 +730,7 @@
       return;
     }
     resetRetime(); // 新文件替换全部字幕，丢弃未确认的变速预览
+    resetFrameAlign();
     state.cues = cues;
     state.fileName = name.replace(/\.[^.]*$/, '') + '.srt';
     state.undoStack = [];
@@ -571,7 +787,8 @@
       '5', '00:00:08,800 --> 00:00:11,000', '每块至少 500ms，块间至少 100ms，起点不为负', '',
       '6', '00:00:11,300 --> 00:00:13,600', 'Ctrl+滚轮缩放时间轴，Ctrl+Z 撤销操作', '',
       '7', '00:00:13,900 --> 00:00:16,500', '「区间变速」设置入点、出点与目标时长，预览确认后应用', '',
-      '8', '00:00:16,800 --> 00:00:19,200', '完成后点击「导出 SRT」保存合法字幕文件', '',
+      '8', '00:00:16,800 --> 00:00:19,200', '「帧对齐」可选 23.976/24/25/29.97/30fps，容差内全局最优吸附', '',
+      '9', '00:00:19,500 --> 00:00:21,800', '完成后点击「导出 SRT」保存合法字幕文件', '',
     ].join('\n'), 'demo.srt');
   });
 

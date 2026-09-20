@@ -21,6 +21,13 @@
  *   - 映射后在受影响字幕内部自动补足最短时长、后移间隔不足的后继；
  *   - 若约束只能依靠改动区间外字幕才能满足，则不静默改写，
  *     返回可定位的冲突列表。
+ *
+ * 帧对齐：
+ *   - 把全部字幕的起止点吸附到指定帧率（23.976/24/25/29.97/30）的帧边界；
+ *   - 在「单点最大允许偏移」容差内做全局动态规划：冲突时联动选择相邻帧，
+ *     使所有点的总绝对偏移最小；总分相同取整体较早（逐帧下标字典序更小）方案；
+ *   - 始终保持每块 >= 500ms、相邻间隔 >= 100ms、起点 >= 0 与原顺序；
+ *   - 任一点超出容差或无可行方案时返回可定位冲突，不修改任何字幕。
  */
 (function (root, factory) {
   const api = factory();
@@ -290,6 +297,183 @@
     return cues;
   }
 
+  /* ---------------- 帧对齐 ---------------- */
+
+  /** 可选帧率（fps）与帧周期（ms）。23.976/29.97 按 NTSC 丢帧前精确比率。 */
+  const FRAME_RATES = [
+    { label: '23.976', fps: 24000 / 1001, frameMs: 1001 * 1000 / 24000 },
+    { label: '24', fps: 24, frameMs: 1000 / 24 },
+    { label: '25', fps: 25, frameMs: 40 },
+    { label: '29.97', fps: 30000 / 1001, frameMs: 1001 * 1000 / 30000 },
+    { label: '30', fps: 30, frameMs: 1000 / 30 },
+  ];
+
+  /** 按帧率标签取帧周期（ms）；未知标签返回 null */
+  function framePeriodMs(fpsLabel) {
+    const f = FRAME_RATES.find(x => x.label === String(fpsLabel));
+    return f ? f.frameMs : null;
+  }
+
+  /** 帧下标 n 对应的帧边界时间（ms，四舍五入到 SRT 的 1ms 精度） */
+  function frameEdgeMs(n, frameMs) {
+    const e = Math.round(n * frameMs);
+    return Object.is(e, -0) ? 0 : e; // n=-0 时避免产生 -0
+  }
+
+  /**
+   * 规划帧对齐（纯函数，不修改 cues）。
+   *
+   * 把每条字幕的起止点（共 2N 个，按时序串成 s0<=e0<=s1<=e1...）吸附到
+   * frameMs 的整数倍帧边界；每个点只能落在距原值不超过 toleranceMs 的帧上。
+   * 约束：起点对应帧下标 >= 0；同块 end-start >= 500ms；相邻块 start-prevEnd >= 100ms。
+   * 目标：所有点绝对偏移之和最小；同分取整体较早方案（帧下标向量字典序最小）。
+   * 冲突时点与点联动选择相邻帧（动态规划全局求解，而非各自就近贪心）。
+   *
+   * @param cues
+   * @param fpsLabel    '23.976' | '24' | '25' | '29.97' | '30'
+   * @param toleranceMs 单点最大允许偏移（非负整数 ms）
+   * @returns 成功 { ok:true, fpsLabel, frameMs, toleranceMs, totalDeltaMs,
+   *                 maxDeltaMs, changes:[{index,start,end,startDelta,endDelta}] }
+   *          失败 { ok:false, reason } 或 { ok:false, conflicts:[{index,message}] }
+   */
+  function planFrameAlign(cues, fpsLabel, toleranceMs) {
+    const frameMs = framePeriodMs(fpsLabel);
+    if (frameMs == null) {
+      return { ok: false, reason: '不支持的帧率：' + fpsLabel + '（可选 23.976 / 24 / 25 / 29.97 / 30）' };
+    }
+    toleranceMs = Number(toleranceMs);
+    if (!Number.isInteger(toleranceMs) || toleranceMs < 0) {
+      return { ok: false, reason: '单点最大允许偏移必须是不小于 0 的整数毫秒' };
+    }
+    if (!cues.length) return { ok: false, reason: '当前没有字幕' };
+
+    const n = cues.length;
+    // 点序列：偶数位 p=2i 为第 i 块起点，奇数位 p=2i+1 为终点
+    const points = [];
+    for (let i = 0; i < n; i++) {
+      points.push({ cue: i, edge: 'start', t: cues[i].start });
+      points.push({ cue: i, edge: 'end', t: cues[i].end });
+    }
+
+    // 每个点在容差窗口内的候选帧下标（n 值越大时间越晚），按升序
+    const candidates = points.map(pt => {
+      const near = pt.t / frameMs;
+      const lo = Math.ceil(near - toleranceMs / frameMs - 1e-9);
+      const hi = Math.floor(near + toleranceMs / frameMs + 1e-9);
+      const out = [];
+      for (let k = lo; k <= hi; k++) {
+        if (Math.abs(frameEdgeMs(k, frameMs) - pt.t) <= toleranceMs) out.push(k + 0); // -0 -> +0
+      }
+      return out;
+    });
+
+    // 超容差的点：最近的帧也落不进容差窗口
+    const conflicts = [];
+    candidates.forEach((cand, p) => {
+      if (cand.length) return;
+      const pt = points[p];
+      const nearest = frameEdgeMs(Math.round(pt.t / frameMs), frameMs);
+      const delta = Math.abs(nearest - pt.t);
+      conflicts.push({
+        index: pt.cue,
+        message: '第 ' + (pt.cue + 1) + ' 条' + (pt.edge === 'start' ? '起点' : '终点') +
+          ' ' + msToTimecode(pt.t) + ' 超出容差：最近帧边界 ' + msToTimecode(nearest) +
+          '（偏移 ' + delta + 'ms > ' + toleranceMs + 'ms），请加大单点最大允许偏移',
+      });
+    });
+    if (conflicts.length) return { ok: false, conflicts };
+
+    // 相邻点间最小间隔（ms）：块内为最短时长，块间为最小间隔
+    const minGapAt = (p) => (p % 2 === 1 ? MIN_DURATION_MS : MIN_GAP_MS);
+
+    // 动态规划：dp[p][j] = 走到第 p 个点选第 j 个候选帧时的
+    //   { cost（到该点为止的最小总偏移）， k（前一点所选候选下标） }
+    const dp = [];
+    dp.push(candidates[0].map(k => (frameEdgeMs(k, frameMs) >= 0)
+      ? { cost: Math.abs(frameEdgeMs(k, frameMs) - points[0].t), k: -1 }
+      : null));
+
+    for (let p = 1; p < points.length; p++) {
+      const prevLayer = dp[p - 1];
+      const prevCand = candidates[p - 1];
+      const gap = minGapAt(p);
+      const layer = new Array(candidates[p].length).fill(null);
+      let scanIdx = -1; // 已纳入窗口的前驱候选扫描位置（无论是否可达都前进）
+      let bestIdx = -1; // 窗口内可达且 cost 最小的前驱候选
+      for (let j = 0; j < candidates[p].length; j++) {
+        const edge = frameEdgeMs(candidates[p][j], frameMs);
+        // 新进入窗口的前驱候选：时间上满足 prevEdge <= edge - gap
+        while (scanIdx + 1 < prevCand.length &&
+               frameEdgeMs(prevCand[scanIdx + 1], frameMs) <= edge - gap) {
+          scanIdx++;
+          if (prevLayer[scanIdx] &&
+              (bestIdx < 0 || prevLayer[scanIdx].cost < prevLayer[bestIdx].cost)) {
+            bestIdx = scanIdx;
+          }
+        }
+        if (bestIdx >= 0 && prevLayer[bestIdx]) {
+          // 候选按帧下标升序遍历；同分由更靠前（更早）的前驱胜出，故严格小于才更新
+          layer[j] = {
+            cost: prevLayer[bestIdx].cost + Math.abs(edge - points[p].t),
+            k: bestIdx,
+          };
+        }
+      }
+      if (!layer.some(Boolean)) {
+        const pt = points[p];
+        return {
+          ok: false,
+          conflicts: [{
+            index: pt.cue,
+            message: '第 ' + (pt.cue + 1) + ' 条' + (pt.edge === 'start' ? '起点' : '终点') +
+              ' ' + msToTimecode(pt.t) + ' 在 ' + toleranceMs + 'ms 容差内找不到满足约束' +
+              '（每块 ≥' + MIN_DURATION_MS + 'ms、相邻间隔 ≥' + MIN_GAP_MS + 'ms、起点 ≥0）的' +
+              '全局对齐方案，请加大单点最大允许偏移或先手动修整时间轴',
+          }],
+        };
+      }
+      dp.push(layer);
+    }
+
+    // 终点取最优；同样严格更小才更新 → 同分保留更早候选
+    const lastLayer = dp[dp.length - 1];
+    let bestJ = -1;
+    for (let j = 0; j < lastLayer.length; j++) {
+      if (lastLayer[j] && (bestJ < 0 || lastLayer[j].cost < lastLayer[bestJ].cost)) bestJ = j;
+    }
+
+    // 回溯各点所选帧下标
+    const chosenFrames = new Array(points.length);
+    let j = bestJ;
+    for (let p = points.length - 1; p >= 0; p--) {
+      chosenFrames[p] = candidates[p][j];
+      j = dp[p][j].k;
+    }
+
+    const changes = [];
+    let totalDelta = 0;
+    let maxDelta = 0;
+    for (let i = 0; i < n; i++) {
+      const start = frameEdgeMs(chosenFrames[2 * i], frameMs);
+      const end = frameEdgeMs(chosenFrames[2 * i + 1], frameMs);
+      const startDelta = start - cues[i].start;
+      const endDelta = end - cues[i].end;
+      totalDelta += Math.abs(startDelta) + Math.abs(endDelta);
+      maxDelta = Math.max(maxDelta, Math.abs(startDelta), Math.abs(endDelta));
+      changes.push({ index: i, start, end, startDelta, endDelta });
+    }
+
+    return {
+      ok: true,
+      fpsLabel: String(fpsLabel),
+      frameMs,
+      toleranceMs,
+      totalDeltaMs: totalDelta,
+      maxDeltaMs: maxDelta,
+      changes,
+    };
+  }
+
   /** 校验当前状态是否满足全部约束，返回问题列表（空数组 = 合法） */
   function validate(cues) {
     const problems = [];
@@ -306,6 +490,9 @@
   return {
     MIN_DURATION_MS,
     MIN_GAP_MS,
+    FRAME_RATES,
+    framePeriodMs,
+    frameEdgeMs,
     msToTimecode,
     timecodeToMs,
     parseTimeInput,
@@ -316,6 +503,7 @@
     applyMove,
     planRetime,
     applyPlan,
+    planFrameAlign,
     validate,
   };
 });
