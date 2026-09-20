@@ -15,6 +15,7 @@
       <button id="btn-demo">载入示例</button>
       <button id="btn-undo" disabled>撤销</button>
       <button id="btn-retime">区间变速</button>
+      <button id="btn-frame">帧对齐</button>
       <button id="btn-export" class="primary" disabled>导出 SRT</button>
       <span class="sep"></span>
       <button id="btn-zoom-out" title="缩小">−</button>
@@ -37,6 +38,36 @@
     </div>
     <div id="retime-info"></div>
     <ul id="retime-conflicts"></ul>
+  </section>
+
+  <section id="frame-panel" hidden>
+    <div class="retime-row">
+      <label>帧率
+        <select id="frame-fps">
+          <option value="23.976">23.976 fps</option>
+          <option value="24" selected>24 fps</option>
+          <option value="25">25 fps</option>
+          <option value="29.97">29.97 fps</option>
+          <option value="30">30 fps</option>
+        </select>
+      </label>
+      <label>单点最大允许偏移(ms) <input id="frame-tol" class="mono" type="text" value="100"></label>
+      <button id="btn-frame-preview" class="primary">预览</button>
+      <button id="btn-frame-apply" disabled>应用对齐</button>
+      <button id="btn-frame-cancel" disabled>取消预览</button>
+      <button id="btn-frame-close" title="收起面板">收起</button>
+    </div>
+    <div id="frame-info"></div>
+    <ul id="frame-conflicts"></ul>
+    <div id="frame-preview" hidden>
+      <table>
+        <thead>
+          <tr><th class="col-idx">#</th><th>对齐前开始</th><th>对齐后开始</th><th>起点偏移</th>
+          <th>对齐前结束</th><th>对齐后结束</th><th>终点偏移</th></tr>
+        </thead>
+        <tbody id="frame-preview-body"></tbody>
+      </table>
+    </div>
   </section>
 
   <main>

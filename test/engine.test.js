@@ -297,3 +297,148 @@ test('区间变速：应用方案后整体合法且可导出回读', () => {
   assert.deepEqual(E.validate(cues), []);
   assert.deepEqual(E.parseSrt(E.formatSrt(cues)), cues); // 导出可回读
 });
+
+/* ---------------- 帧对齐 ---------------- */
+
+// 断言全部起止点都落在帧边界（毫秒精度）
+function assertOnFrames(cues, fps) {
+  const rate = E.FRAME_RATES[fps];
+  for (const c of cues) {
+    for (const t of [c.start, c.end]) {
+      const k = Math.round(t * rate.den / rate.num);
+      assert.equal(E.frameToMs(k, rate), t,
+        ms2tc(t) + ' 不是 ' + fps + 'fps 帧边界（最近帧 ' + E.msToTimecode(E.frameToMs(k, rate)) + '）');
+    }
+  }
+}
+function ms2tc(ms) { return E.msToTimecode(ms); }
+
+test('帧对齐：24fps 全部起止点落到帧边界并满足约束，纯函数不改输入', () => {
+  const cues = [cue(100, 610, 'a'), cue(705, 1215, 'b')];
+  const before = JSON.parse(JSON.stringify(cues));
+  const plan = E.planFrameAlign(cues, 24, 100);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(cues, before); // 规划阶段不修改输入
+  E.applyFramePlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [83, 583],      // 就近：100->83，610->583，时长 500
+    [708, 1208],    // 705->708，1215->1208
+  ]);
+  assertOnFrames(cues, 24);
+  assert.deepEqual(E.validate(cues), []);
+  assert.equal(plan.maxOffsetMs, 27);
+});
+
+test('帧对齐：间隔冲突时联动选择相邻帧，取全局总绝对偏移最小', () => {
+  // 独立就近：a.end 525 -> 533(+8)，b.start 610 -> 600(-10)，间隔仅 67ms < 100
+  // 方案 A：a.end=500(-25)、b.start=600(-10)、b.end=1100(-10) => 45（间隔/时长均满足）
+  // 方案 B：a.end=533(+8)、b.start=633(+23)，b.end 须 ≥1133(+23) 才够 500ms => 54
+  const cues = [cue(0, 525, 'a'), cue(610, 1110, 'b')];
+  const plan = E.planFrameAlign(cues, 30, 40);
+  assert.equal(plan.ok, true);
+  E.applyFramePlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [[0, 500], [600, 1100]]);
+  assert.ok(cues[1].start - cues[0].end >= 100);
+  assertOnFrames(cues, 30);
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('帧对齐：总偏移相同时按时间顺序逐点取较早帧', () => {
+  // 104 位于 24fps 帧 83 与 125 正中（均偏离 21ms）
+  const cues = [cue(104, 1104, 'x')];
+  const plan = E.planFrameAlign(cues, 24, 100);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.changes[0].start, 83); // 同分取更早
+  assert.equal(plan.changes[0].end, 1083); // 1104 距 1083(21) 与 1125(21)，取更早
+});
+
+test('帧对齐：相邻间隔恰为 100ms 时独立就近即可满足，保持顺序与间隔', () => {
+  const cues = [cue(0, 516, 'a'), cue(616, 1116, 'b')]; // 30fps
+  // 516 -> 500(-16)，616 -> 600(-16)，间隔 100 恰好可行；1116 -> 1100(-16)
+  const plan = E.planFrameAlign(cues, 30, 30);
+  assert.equal(plan.ok, true);
+  E.applyFramePlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [[0, 500], [600, 1100]]);
+  assertOnFrames(cues, 30);
+});
+
+test('帧对齐：23.976（NTSC 分数帧率）帧边界正确', () => {
+  // 24000/1001：第 24 帧 = 1001ms，第 240 帧 = 10010ms
+  assert.equal(E.frameToMs(24, E.FRAME_RATES[23.976]), 1001);
+  const cues = [cue(1003, 2005, 'x')];
+  const plan = E.planFrameAlign(cues, 23.976, 50);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.changes[0].start, 1001); // 1003 -> 1001
+  E.applyFramePlan(cues, plan);
+  assertOnFrames(cues, 23.976);
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('帧对齐：29.97 与 25fps 均可对齐', () => {
+  assert.equal(E.frameToMs(30, E.FRAME_RATES[29.97]), 1001);
+  let cues = [cue(0, 650)];
+  let plan = E.planFrameAlign(cues, 29.97, 50);
+  assert.equal(plan.ok, true);
+  E.applyFramePlan(cues, plan);
+  assertOnFrames(cues, 29.97);
+
+  cues = [cue(0, 650)]; // 25fps：650 距 640(-10) 最近
+  plan = E.planFrameAlign(cues, 25, 50);
+  assert.equal(plan.ok, true);
+  assert.deepEqual([plan.changes[0].start, plan.changes[0].end], [0, 640]);
+});
+
+test('帧对齐：任一点超出容差 -> 失败且不修改，冲突可定位到该条', () => {
+  const cues = [cue(104, 610, 'a'), cue(708, 1208, 'b')]; // 104 距帧 21ms
+  const before = JSON.parse(JSON.stringify(cues));
+  const plan = E.planFrameAlign(cues, 24, 10);
+  assert.equal(plan.ok, false);
+  assert.ok(plan.conflicts.length >= 1);
+  assert.equal(plan.conflicts[0].index, 0);
+  assert.match(plan.conflicts[0].message, /第 1 条起点/);
+  assert.match(plan.conflicts[0].message, /10ms/);
+  assert.deepEqual(cues, before);
+});
+
+test('帧对齐：单点均在容差内但链式无可行解 -> 可定位冲突，不修改', () => {
+  const cues = [cue(0, 525, 'a'), cue(610, 1110, 'b')];
+  const before = JSON.parse(JSON.stringify(cues));
+  const plan = E.planFrameAlign(cues, 30, 10);
+  // a.end 窗口 [515,535] 只有 533；b.start 窗口 [600,620] 只有 600；间隔 67 < 100
+  assert.equal(plan.ok, false);
+  assert.equal(plan.conflicts.length, 1);
+  assert.equal(plan.conflicts[0].index, 1);
+  assert.match(plan.conflicts[0].message, /第 2 条起点/);
+  assert.deepEqual(cues, before);
+  // 放宽到 40ms 即有联动可行解
+  assert.equal(E.planFrameAlign(cues, 30, 40).ok, true);
+});
+
+test('帧对齐：时长不足约束也会触发联动（保持每块 ≥500ms）', () => {
+  // 24fps：构造一条字幕起止独立就近后不足 500ms
+  // start=104 -> 125(+21)/83(-21)；end=604 -> 583(-21)/625(+21)
+  // 独立就近 start=83,end=583 恰好 500；改用 start=106（近83/-23 或125/+19->125）
+  const cues = [cue(106, 604, 'x')];
+  const plan = E.planFrameAlign(cues, 24, 30);
+  assert.equal(plan.ok, true);
+  E.applyFramePlan(cues, plan);
+  assert.ok(cues[0].end - cues[0].start >= 500);
+  assertOnFrames(cues, 24);
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('帧对齐：参数校验（非法帧率、非正容差、空字幕）', () => {
+  assert.match(E.planFrameAlign([], 24, 50).reason, /没有需要对齐的字幕/);
+  assert.match(E.planFrameAlign([cue(0, 1000)], 23.98, 50).reason, /不支持的帧率/);
+  assert.match(E.planFrameAlign([cue(0, 1000)], 24, 0).reason, /最大允许偏移/);
+});
+
+test('帧对齐：已对齐的字幕原样不动（零偏移）', () => {
+  const cues = [cue(0, 1000, 'a'), cue(1120, 2000, 'b')]; // 25fps：40ms 的整数倍
+  const plan = E.planFrameAlign(cues, 25, 20);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.totalOffsetMs, 0);
+  assert.deepEqual(plan.changes.map(c => [c.dStart, c.dEnd]),
+    [[0, 0], [0, 0]]);
+});
+
